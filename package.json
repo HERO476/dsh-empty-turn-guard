@@ -1,0 +1,33 @@
+{
+  "name": "dsh-empty-turn-guard",
+  "version": "0.1.0",
+  "description": "DSH plugin: detect assistant turns that end with no visible text (zero-width placeholder) and re-prompt the model to write the answer; also injects a visible-closing-answer system prompt rule.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "plugin",
+    "empty-turn",
+    "zero-width",
+    "reasoning",
+    "transcript"
+  ],
+  "license": "MIT",
+  "author": "huangpeiyan",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
