@@ -82,6 +82,7 @@
 - 只 import Node 内置模块（`node:fs` / `node:os` / `node:path` / `node:crypto`）。插件被装进 profile 的 `node_modules` 后，裸名 `@deepseek-ai/*` 在插件目录下 Node 解析不到，少一个依赖就少一个「插件整个加载失败」的风险面。
 - 不导出 `Config` schema（宿主允许无 schema 的 entry），配置在 `apply(ctx, config)` 内部做防御性默认值合并。
 - 所有逻辑包在 try/catch 里：任何异常只写日志，不向上抛，不会拖垮宿主回合。
+- 宿主门槛 `engines.dsh = ">=0.2.1-rc.1"`：本插件用到的宿主 API 在 `0.2.1-rc.1` / `rc.2` / `rc.3` 三个版本里实现完全一致，所以门槛只设到 rc.1。**不要写成 `>=0.2.1`**——semver 里预发布版本不满足不含预发布标识的同段范围，`0.2.1-rc.3` 对 `>=0.2.1` 判为 `false`，会连 rc 版本一起挡掉。门槛不满足时宿主会把整个 bundle 静默跳过（启动只留一行 `skipping profile bundle`）。
 
 ## License
 

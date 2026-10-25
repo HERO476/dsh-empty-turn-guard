@@ -3,6 +3,26 @@
 本文件记录 dsh-empty-turn-guard 的所有重要变更，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.2] - 2026-10-25
+
+放宽宿主版本门槛：功能无改动。
+
+### 变更
+
+- `engines.dsh` 从 `>=0.2.1-rc.2` 放宽到 `>=0.2.1-rc.1`。
+  依据：本插件用到的宿主 API（`ctx.systemPrompt.section`、`agent.send` / `followup` / `inject`、
+  `agent/created`、`session/event`、`dsh.bundle.patch` 加载）在 DSH `0.2.1-rc.1` / `rc.2` / `rc.3`
+  三个版本的实现**逐字节相同**（`dsh-system-prompt`、`dsh-agent-loop`、`dsh-agent`、`dsh-session`、
+  `dsh-app-boot`、`dsh-plugin-manager`、`dsh-web-app` 的 `lib/index.js` md5 三版本一致，差异仅在
+  `package.json` 的版本号字段）。所以 rc.1 上代码本来就能跑，旧门槛只是把它挡在门外——
+  宿主 `dsh-app-boot` 的版本闸门不满足时会把 bundle 收进 `skippedBundles`，启动只打一行
+  `dsh: skipping profile bundle "dsh-empty-turn-guard": …` 然后**静默不加载**。
+
+### 注意
+
+- **不要**把范围写成 `>=0.2.1`。semver 规则里预发布版本不满足「不含预发布标识的同段范围」，
+  `0.2.1-rc.3` 对 `>=0.2.1` 判为 `false`，那样会把 rc.1 / rc.2 / rc.3 全部挡掉。
+
 ## [0.1.1] - 2026-10-25
 
 发布规范化版本：功能与 0.1.0 一致，补齐工程与元数据。
