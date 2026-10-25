@@ -1,13 +1,29 @@
 {
   "name": "dsh-empty-turn-guard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH plugin: detect assistant turns that end with no visible text (zero-width placeholder) and re-prompt the model to write the answer; also injects a visible-closing-answer system prompt rule.",
+  "license": "MIT",
+  "author": "HERO476",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HERO476/dsh-empty-turn-guard.git"
+  },
+  "homepage": "https://github.com/HERO476/dsh-empty-turn-guard#readme",
+  "bugs": {
+    "url": "https://github.com/HERO476/dsh-empty-turn-guard/issues"
+  },
   "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
   "files": [
     "lib/",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "keywords": [
@@ -20,14 +36,21 @@
     "reasoning",
     "transcript"
   ],
-  "license": "MIT",
-  "author": "huangpeiyan",
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "scripts": {
+    "test": "node test/guard.test.mjs",
+    "check": "node scripts/check-metadata.mjs",
+    "prepublishOnly": "node scripts/check-metadata.mjs && node test/guard.test.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  },
-  "engines": {
-    "node": ">=20"
   }
 }
