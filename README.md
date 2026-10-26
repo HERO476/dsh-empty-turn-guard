@@ -12,10 +12,10 @@
 
 ## 行为
 
-1. **检测**：累计本回合所有 `assistant/message` 的 text 块（剥掉 `U+200B–U+200F / U+202A–U+202E / U+2060–U+2064 / U+FEFF / U+00AD` 后 trim）。`turn/end` 时若「有助手消息 且 可见字符数 < minVisibleChars 且 reason.kind === 'completed'」，判定为空回合。
-2. **补写**：延迟 `delayMs` 后通过 `agent.send(msg, 'next-turn', true)` 排一条 `plugin:empty-turn-guard` 来源的消息，让模型在下一回合补结论；若 `send` 抛错，依次降级到 `agent.followup(msg)` → `agent.inject(msg)`。
+1. **检测**：累计本回合所有 `assistant/message` 的 text 块（剥掉 `U+00AD / U+034F / U+061C / U+115F / U+1160 / U+17B4 / U+17B5 / U+180B–U+180E / U+200B–U+200F / U+2028–U+202E / U+2060–U+2065 / U+206A–U+206F / U+2800 / U+3164 / U+FE00–U+FE0F / U+FEFF / U+FFA0 / U+E0100–U+E01EF` 后 trim）。`turn/end` 时若「可见字符数 < minVisibleChars 且 reason.kind === 'completed'」，判定为空回合 —— **没有任何 assistant 消息的 completed 回合也算空**（0 < 1），这类回合以前会漏判。
+2. **补写**：延迟 `delayMs` 后通过 `agent.send(msg, 'next-turn', true)` 排一条 `plugin:empty-turn-guard` 来源的消息，让模型在下一回合补结论；若 `send` 抛错，依次降级到 `agent.followup(msg)` → `agent.inject(msg)`。消息正文明确写出「插件自动补发」，不自称普通用户输入。
 3. **收尾指令**：注册一段 system prompt（name `empty-turn-guard`，order 960，`interpolate: false`），要求每回合以看得见的正文结束、禁止用零宽字符/空白/空行充当回答。
-4. **防误伤**：同一回合最多补一次；补写回合再空则停止连环；每会话每小时最多 `maxNudgesPerHour` 次；定时器未触发前收到真人消息立即取消；`plugin:empty-turn-guard` 来源的消息不参与判定。
+4. **防误伤**：同一回合最多补一次；补写回合再空则停止连环；每会话每小时最多 `maxNudgesPerHour` 次（按**投递成功**计，取消/失败不占额度）；定时器未触发前收到**真人消息**（`source.kind === 'user'`）立即取消，宿主每步注入的 `runtime-context` 消息不算真人；新回合自己起来时丢弃过期补写；`plugin:empty-turn-guard` 来源的消息不参与判定。
 
 非 `completed` 的回合（`interrupted` / `error` / `aborted` / `max-tokens` / `blocked`）一律不补写。
 
@@ -52,30 +52,32 @@
 - id: empty-turn-guard
   name: dsh-empty-turn-guard
   config:
-    enabled: true            # false = 只保留收尾指令，不补写
+    enabled: true            # false = 只保留收尾指令，不补写（字符串 "false" 也认）
     injectInstruction: true  # false = 不注入 system prompt 段落
     instructionText: ''      # 非空则替换内置那段收尾指令
-    minVisibleChars: 1       # 可见字符数下限
-    delayMs: 900             # 补写前等待（毫秒）
-    maxNudgesPerHour: 3      # 每会话每小时的补写上限
-    logFile: ''              # 空 = <home>/.dsh/logs/empty-turn-guard.log
+    minVisibleChars: 1       # 可见字符数下限（<1 按 1 处理）
+    delayMs: 900             # 补写前等待（毫秒，0–60000，非法值回落 900）
+    maxNudgesPerHour: 3      # 每会话每小时的补写上限（0 = 关闭补写）
+    logFile: ''              # 空 = <DSH_HOME>/logs/empty-turn-guard.log
 ```
+
+配置做严格解析：`maxNudgesPerHour: 0` 是**关闭补写**，不会被默认值吞成 3；`delayMs: "abc"` 这类非法值回落到默认值；`enabled: "false"`（字符串）与 `false` 等价。
 
 ## 日志
 
-默认写到 `<home>/.dsh/logs/empty-turn-guard.log`（主路径不可写时兜底到系统临时目录）：
+默认写到 `<DSH_HOME>/logs/empty-turn-guard.log`（未设 `DSH_HOME` 时是 `~/.dsh/logs/…`；主路径不可写时兜底到系统临时目录；超过 5 MB 自动轮转为 `.1`）：
 
 ```
-[2026-10-25T01:49:13.941Z] plugin activated: pid=17520 enabled=true instruction=true
+[2026-10-25T01:49:13.941Z] plugin activated: pid=17520 enabled=true instruction=true dshHome=C:\Users\me\.dsh
 [2026-10-25T01:49:13.942Z] prompt section registered: order=960 chars=222
 [2026-10-25T01:49:13.942Z] guard armed (uptime=1ms)
-[2026-10-25T01:58:02.114Z] turn/end turn=3 kind=completed steps=4 visibleChars=812 empty=false
-[2026-10-25T02:03:41.507Z] turn/end turn=4 kind=completed steps=6 visibleChars=0 empty=true
-[2026-10-25T02:03:41.508Z] nudge SCHEDULED turn=4 delay=900ms (empty completed turn)
-[2026-10-25T02:03:42.561Z] nudge DELIVERED via send(next-turn,wakeup)
+[2026-10-25T01:58:02.114Z] turn/end turn=3 kind=completed steps=4 visibleChars=812 empty=false wasGuard=false [5f884825]
+[2026-10-25T02:03:41.507Z] turn/end turn=4 kind=completed steps=6 visibleChars=0 empty=true wasGuard=false [5f884825]
+[2026-10-25T02:03:41.508Z] nudge SCHEDULED turn=4 delay=900ms [5f884825] (empty completed turn)
+[2026-10-25T02:03:42.561Z] nudge DELIVERED via send(next-turn,wakeup) [5f884825]
 ```
 
-正常回合只需看 `empty=false`；出现 `empty=true` 就应紧跟一条 `nudge DELIVERED`。
+正常回合只需看 `empty=false`；出现 `empty=true` 就应紧跟一条 `nudge DELIVERED`。`[...]` 是会话 id 前 8 位，`wasGuard` 表示该回合是不是补写回合。
 
 ## 实现约束
 
@@ -83,6 +85,7 @@
 - 不导出 `Config` schema（宿主允许无 schema 的 entry），配置在 `apply(ctx, config)` 内部做防御性默认值合并。
 - 所有逻辑包在 try/catch 里：任何异常只写日志，不向上抛，不会拖垮宿主回合。
 - 宿主门槛 `engines.dsh = ">=0.2.1-rc.1"`：本插件用到的宿主 API 在 `0.2.1-rc.1` / `rc.2` / `rc.3` 三个版本里实现完全一致，所以门槛只设到 rc.1。**不要写成 `>=0.2.1`**——semver 里预发布版本不满足不含预发布标识的同段范围，`0.2.1-rc.3` 对 `>=0.2.1` 判为 `false`，会连 rc 版本一起挡掉。门槛不满足时宿主会把整个 bundle 静默跳过（启动只留一行 `skipping profile bundle`）。
+- `inject = ['systemPrompt']` 是 cordis 的**硬依赖**，不做「可选依赖」改造：本版本 `@deepseek-ai/cordis` 的 `Inject.resolve` 只接受「数组」或「name → config 映射」，没有 `required`/`optional` 语义；写成 `{ optional: [...] }` 会被当成「等一个叫 optional 的服务」，插件将永不激活。
 
 ## License
 

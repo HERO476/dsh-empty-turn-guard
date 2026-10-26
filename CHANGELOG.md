@@ -3,6 +3,34 @@
 本文件记录 dsh-empty-turn-guard 的所有重要变更，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.3] - 2026-10-26
+
+修复评审（技术方案评审团：架构 / 应用安全 / 现实核对）发现的缺陷，重点是空回合补写的状态机。
+
+### 修复
+
+- **补写状态机（高）**：`awaitingGuardTurn` 在三条早退路径上不清零——真人插话取消、补写回合非 `completed`（`aborted` / `error` / `max-tokens`）、三级投递全失败——导致**下一次真正的空回合被误判成「连环补写」而静默跳过**，日志还写 `stop chaining`。现在 `turn/end` 入口先取 `wasGuard` 再无条件清零；投递失败也显式清零。
+- **`runtime-context` 被当成真人插话（中）**：宿主每一步都会 append 一条 `source.kind === 'runtime-context'` 的 `user/message`（`dsh-agent-loop`），旧实现把所有非本插件的 `user/message` 都当成真人取消补写，实际上补写几乎必被取消。现在只有 `source.kind === 'user'`（`source` 缺失时保守视为真人）才取消。
+- **小时预算被取消操作吃掉（中）**：旧实现「调度即记账」，取消/失败也占额度；现在按**投递成功**记账。
+- **零宽字符集过窄（中）**：补上 `U+3164`（韩文填充符，最常被当作「隐形字」）、`U+2800`（盲文空白）、`U+180B–U+180E`、`U+FE00–U+FE0F`、`U+2065`、`U+206A–U+206F`、`U+FFA0`、`U+E0100–U+E01EF`、`U+034F`、`U+061C`、`U+115F`、`U+1160`、`U+17B4`、`U+17B5`、`U+2028`、`U+2029` 等。
+- **配置语义**：`maxNudgesPerHour: 0` 现在真的关闭补写（旧实现被 `|| 3` 吞成 3）；`delayMs: "abc"` 等非法值回落默认值（旧实现 `|| 0` 变成 0 毫秒）；`enabled: "false"` 字符串现在真的关闭（旧实现只认布尔 `false`）。
+- **回合竞态**：空回合结束后 900ms 内若新回合自己起来，旧实现会把补写插进别人的回合；现在 `turn/start` 取消过期定时器，定时器触发时再校验 `pendingTurn` 是否仍等于当前回合。
+- **漏判**：没有任何 `assistant/message` 的 `completed` 回合（`visibleChars === 0`）旧实现因为 `assistantMessages > 0` 前置条件而漏判，现在会补写。
+- **热启用惰性**：旧实现只靠 `agent/created` 填 agent 表，插件热启用时存量会话永远没有 agent、补写全被 `SKIPPED`。现在启动时向宿主 `agents` 注册表 `list()` 回填一次。
+- **日志**：跟随 `DSH_HOME`（旧实现硬编码 `os.homedir()`）、超过 5 MB 自动轮转、每行带会话 id 前 8 位与 `wasGuard`。
+
+### 变更
+
+- 补写消息正文不再要求模型「不要提及这条提醒」：该消息以 `role:'user'` 落进持久转录，隐瞒来源属于破坏转录完整性。现在明确写「插件自动补发」，并带 `source = { kind: 'plugin:empty-turn-guard', plugin, reason }`。
+
+### 测试
+
+- `test/guard.test.mjs` 从 9 条扩到 18 条，并修正**事件载荷形状**：宿主 `session.append(type, data)` 的 `data` 就是消息本体（`data.source.kind`），旧用例包了一层 `{ message: { source } }`，导致「真人插话取消」「plugin 来源不参与判定」两条用例实际空转。新增：非 completed 后不污染下一回合、投递全失败后可恢复、`runtime-context` 不取消、新回合丢弃过期补写、配置 0/非法值语义、扩展零宽集、热启用回填、卸载清理。
+
+### 明确不做
+
+- `inject = ['systemPrompt']` 保持硬依赖。本版本 `@deepseek-ai/cordis` 的 `Inject.resolve` 只接受数组或「name → config 映射」，**没有 `required`/`optional` 语义**；改成 `{ optional: [...] }` 会被当成「等一个叫 optional 的服务」，插件永不激活。
+
 ## [0.1.2] - 2026-10-25
 
 放宽宿主版本门槛：功能无改动。
