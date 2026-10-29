@@ -3,6 +3,34 @@
 本文件记录 dsh-empty-turn-guard 的所有重要变更，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.5] - 2026-10-29
+
+修复桌面端 / 网页端复核发现的状态机与来源分类问题。
+
+### 修复
+
+- **投递 ≠ 认领（中）**：`awaitingGuardTurn` 过去在 `agent.send()` 成功时就置位，但 send 只是把消息放进
+  `next-turn` 队列；消息在认领前可能被用户停止/会话取消清掉，下一次真正的空回合会被当成「连环补写」
+  跳过。现在投递成功只记录 `nudgeMessageId`（在途），只有转录里出现 `source.kind =
+  'plugin:empty-turn-guard'` 的 `user/message`（被宿主认领）才置位 `awaitingGuardTurn`。在途补写 120 秒
+  未被认领视为过期；上一笔未认领前不再排第二笔。
+- **后台来源白名单覆盖最新宿主（中）**：新增 `agent-instructions` / `ptc-mode` / `model-selection` /
+  `session-reference` / `skill-invocation` / `compact-checkpoint`。这些是宿主或插件写入的上下文/状态消息，
+  不是有人在说话；旧白名单会把它们当插话，取消待发补写。
+- **文档口径**：README 的附件判定改为「助手消息含附件不算空」；补充 `dsh headless` 一次性进程的限制；
+  更新 2026-10-29 的实测样本。
+
+### 测试
+
+- `test/guard.test.mjs` 从 27 条扩到 **28 条**：新增「投递 ≠ 认领」用例；后台注入用例覆盖最新宿主的
+  6 个来源；预算/连环补写用例改为显式模拟宿主认领。
+
+### 验证
+
+- 用真实 DSH `0.2.1-rc.3` 宿主 + 假模型做端到端验证：turn 1 返回 ZWSP → 插件 `nudge DELIVERED` →
+  turn 2 出现 `plugin:empty-turn-guard` 的 `user/message` → 模型返回可见正文，`wasGuard=true`。
+  桌面端生产日志仍未遇到 `completed` 空回合，链路已由 e2e 覆盖。
+
 ## [0.1.4] - 2026-10-29
 
 修复第三轮评审（技术方案评审团：架构 / 应用安全 / 现实核对）确认的缺陷。核心是**空回合判定本身**：

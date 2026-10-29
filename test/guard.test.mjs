@@ -70,6 +70,8 @@ const assistant = (text, tool = false) => ({
 const human = (text = '再说一次') => ({ role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } });
 /** 宿主每步注入的运行时上下文消息。 */
 const runtimeContext = () => ({ role: 'user', content: [{ type: 'text', text: 'Current runtime context…' }], source: { kind: 'runtime-context' } });
+/** 插件自己的补写消息被宿主认领后写进转录的样子。 */
+const guardClaim = () => ({ role: 'user', content: [{ type: 'text', text: '【空回合保护 · 插件自动补发】' }], source: { kind: 'plugin:empty-turn-guard' } });
 
 const cases = [];
 const test = (title, fn) => cases.push({ title, fn });
@@ -146,11 +148,13 @@ test('补写回合仍然为空 → 不连环补写', async () => {
   await sleep(60);
   assert.equal(rig.sent.length, 1);
   rig.fire('turn/start', { turn: 5 });
+  rig.fire('user/message', guardClaim()); // 补写消息被宿主认领
   rig.fire('assistant/message', { turn: 5, step: 1, message: assistant(ZW) });
   rig.fire('turn/end', { turn: 5, reason: { kind: 'completed' } });
   await sleep(60);
   assert.equal(rig.sent.length, 1, 'should not chain a second nudge');
   assert.match(rig.log(), /stop chaining/);
+  assert.match(rig.log(), /wasGuard=true/);
   rig.cleanup();
 });
 
@@ -211,7 +215,7 @@ test('两级投递全失败（inject 已移除） → 清标志，下一次空�
   rig.fire('turn/end', { turn: 11, reason: { kind: 'completed' } });
   await sleep(60);
   assert.equal(rig.sent.length, 0);
-  assert.match(rig.log(), /NOT DELIVERED -> awaitingGuardTurn cleared/);
+  assert.match(rig.log(), /NOT DELIVERED -> no in-flight nudge/);
   // 恢复通道后，下一次真空回合必须还能补写（旧实现会被当成连环补写静默跳过）。
   rig.agent.send = (message, target, wakeup) => { rig.sent.push({ via: 'send', target, wakeup, text: message.content[0].text }); };
   rig.fire('turn/start', { turn: 12 });
@@ -256,8 +260,9 @@ test('maxNudgesPerHour=0 → 关闭补写（不被 || 默认成 3）', async () 
 
 test('小时预算：3 次之后不再补写', async () => {
   const rig = makeRig({ maxNudgesPerHour: 3 });
-  // 每次补写之后接一个「补写成功」的回合，把 awaitingGuardTurn 正常消费掉，
-  // 否则连续空回合会按设计走「stop chaining」而不是继续消耗预算。
+  // 每次补写之后接一个「补写成功」的回合：先让宿主认领补写消息（user/message），
+  // 再产出可见正文，把 awaitingGuardTurn 正常消费掉。
+  // 否则连续空回合会按设计走「stop chaining」或「already awaiting claim」。
   for (let i = 1; i <= 4; i += 1) {
     const t = 20 + i * 2;
     rig.fire('turn/start', { turn: t });
@@ -265,6 +270,7 @@ test('小时预算：3 次之后不再补写', async () => {
     rig.fire('turn/end', { turn: t, reason: { kind: 'completed' } });
     await sleep(40);
     rig.fire('turn/start', { turn: t + 1 });
+    rig.fire('user/message', guardClaim());
     rig.fire('assistant/message', { turn: t + 1, step: 1, message: assistant('补出来的结论') });
     rig.fire('turn/end', { turn: t + 1, reason: { kind: 'completed' } });
     await sleep(40);
@@ -383,8 +389,19 @@ test('会话范围：默认只处理根会话（session-*），子代理裸 UUID
   all.cleanup();
 });
 
-test('后台注入（time-context / skill-catalog / dsh-mnemon）不取消补写；社交桥会取消', async () => {
-  for (const kind of ['time-context', 'skill-catalog', 'dsh-mnemon', 'plugin:other']) {
+test('后台注入（time-context / skill-catalog / dsh-mnemon / agent-instructions / ptc-mode / model-selection / session-reference / skill-invocation / compact-checkpoint）不取消补写；社交桥会取消', async () => {
+  for (const kind of [
+    'time-context',
+    'skill-catalog',
+    'dsh-mnemon',
+    'agent-instructions',
+    'ptc-mode',
+    'model-selection',
+    'session-reference',
+    'skill-invocation',
+    'compact-checkpoint',
+    'plugin:other',
+  ]) {
     const rig = makeRig({ delayMs: 60 });
     rig.fire('turn/start', { turn: 55 });
     rig.fire('assistant/message', { turn: 55, step: 1, message: assistant(ZW) });
@@ -406,6 +423,35 @@ test('后台注入（time-context / skill-catalog / dsh-mnemon）不取消补写
   rig.cleanup();
 });
 
+test('投递 ≠ 认领：未认领的补写不把下一回合当成补写回合，也不重复补写', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 60 });
+  rig.fire('assistant/message', { turn: 60, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 60, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1);
+
+  // 新空回合结束，但补写还在队列里没有被认领：不能把它当成补写回合，也不能再补一笔。
+  rig.fire('turn/start', { turn: 61 });
+  rig.fire('assistant/message', { turn: 61, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 61, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1, 'an unclaimed nudge must not be duplicated');
+  assert.doesNotMatch(rig.log(), /wasGuard=true/);
+  assert.match(rig.log(), /a nudge is already awaiting claim/);
+
+  // 宿主随后认领补写消息：它所在的回合才是补写回合。
+  rig.fire('turn/start', { turn: 62 });
+  rig.fire('user/message', guardClaim());
+  rig.fire('assistant/message', { turn: 62, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 62, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1, 'guard turn still empty -> stop chaining');
+  assert.match(rig.log(), /guard message claimed/);
+  assert.match(rig.log(), /wasGuard=true/);
+  rig.cleanup();
+});
+
 test('只有 inject 可用 → 不算投递成功（不唤醒，不会开新回合）', async () => {
   const rig = makeRig();
   const boom = () => { throw new Error('no waking transport'); };
@@ -417,7 +463,7 @@ test('只有 inject 可用 → 不算投递成功（不唤醒，不会开新回�
   await sleep(60);
   assert.equal(rig.sent.length, 0, 'inject must never be used as a fallback');
   assert.ok(rig.log().includes('all waking transports failed'));
-  assert.ok(rig.log().includes('awaitingGuardTurn cleared'));
+  assert.ok(rig.log().includes('no in-flight nudge'));
   rig.cleanup();
 });
 

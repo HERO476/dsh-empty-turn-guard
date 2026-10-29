@@ -6,18 +6,20 @@
 
 模型偶发「思考完就结束」：`assistant/message` 的 text 块只剩一个零宽空格（U+200B）占位符，reasoning 却有好几千 token。因为 ZWSP 在长度上「非空」，宿主自带的 `EMPTY_RESPONSE` 重试判定不会触发，回合照常以 `turn/end {kind:"completed"}` 结束 —— 聊天界面上就只剩「已完成分析 / 已调用工具 / 用时 8 分 46 秒」这些过程行，**一个字都看不到**，而且这种回合在日志里是「正常完成」的，事后无法补救。
 
-实测样本（本机 208 个会话、766 个回合，2026-10-25 统计，此后未重新统计）：有助手消息但可见正文为空的回合共 39 个（5.1%）；其中 `completed` 的有 8 个（占 649 个 completed 回合的 1.2%）—— 这 8 个正是本插件要救的目标，其余空回合集中在 `interrupted`(19) / `error`(6) / `aborted`(3) / `max-tokens`(3)，本就不该补写。
+实测样本（2026-10-29 复核，本机 277 个会话、1069 个已结束回合）：`completed` 且可见正文为空的回合 6 个（0.6%）；其中 4 个是子代理会话（默认不处理），2 个根会话回合都发生在插件安装前。插件启用后未再出现 `completed` 空回合；其余空回合集中在 `interrupted` / `error` / `aborted` / `max-tokens` / `blocked`，本就不该补写。
 
 本插件在回合结束时补一道判定，把「完成但没内容」变成「完成且有内容」。
 
 ## 行为
 
-1. **检测**：累计本回合所有 `assistant/message` 的 text 块，剥掉不可见字符后 trim。不可见集合用 Unicode 属性 `\p{Default_Ignorable_Code_Point}`（覆盖 `U+00AD / U+034F / U+061C / U+115F / U+1160 / U+17B4 / U+17B5 / U+180B–U+180E / U+200B–U+200F / U+202A–U+202E / U+2060–U+206F / U+FE00–U+FE0F / U+FEFF / U+E0001 / U+E0020–U+E007F / U+E0100–U+E01EF / U+1D173–U+1D17A` 等全部「默认可忽略」码位），再补三个渲染为空的填充符 `U+2800 / U+3164 / U+FFA0` 与行段分隔符 `U+2028 / U+2029`。`turn/end` 时若「可见字符数 < minVisibleChars 且 reason.kind === 'completed'」，判定为空回合 —— **没有任何 assistant 消息的 completed 回合也算空**（0 < 1）。含图片/文件/音视频附件的回合不算空（界面上不是空白）。
-2. **补写**：延迟 `delayMs` 后通过 `agent.send(msg, 'next-turn', true)` 排一条 `plugin:empty-turn-guard` 来源的消息，让模型在下一回合补结论；`send` 抛错时降级到 `agent.followup(msg)`（与前者等价，都是唤醒并开新回合）。**不再使用 `agent.inject`**：它是 `send(msg, 'next-step', false)`，不唤醒，消息只会躺在队列里，旧版据此记 `DELIVERED` 属于假成功。消息正文明确写出「插件自动补发」，不自称普通用户输入。
+1. **检测**：累计本回合所有 `assistant/message` 的 text 块，剥掉不可见字符后 trim。不可见集合用 Unicode 属性 `\p{Default_Ignorable_Code_Point}`（覆盖 `U+00AD / U+034F / U+061C / U+115F / U+1160 / U+17B4 / U+17B5 / U+180B–U+180E / U+200B–U+200F / U+202A–U+202E / U+2060–U+206F / U+FE00–U+FE0F / U+FEFF / U+E0001 / U+E0020–U+E007F / U+E0100–U+E01EF / U+1D173–U+1D17A` 等全部「默认可忽略」码位），再补三个渲染为空的填充符 `U+2800 / U+3164 / U+FFA0` 与行段分隔符 `U+2028 / U+2029`。`turn/end` 时若「可见字符数 < minVisibleChars 且 reason.kind === 'completed'」，判定为空回合 —— **没有任何 assistant 消息的 completed 回合也算空**（0 < 1）。助手消息含图片/文件/音视频附件时该回合不算空（界面上不是空白）；用户消息里的附件不计入这个判定。
+2. **补写**：延迟 `delayMs` 后通过 `agent.send(msg, 'next-turn', true)` 排一条 `plugin:empty-turn-guard` 来源的消息，让模型在下一回合补结论；`send` 抛错时降级到 `agent.followup(msg)`（与前者等价，都是唤醒并开新回合）。**不再使用 `agent.inject`**：它是 `send(msg, 'next-step', false)`，不唤醒，消息只会躺在队列里，旧版据此记 `DELIVERED` 属于假成功。消息正文明确写出「插件自动补发」，不自称普通用户输入。投递成功后只记「在途」并保存消息 id；只有宿主持久转录里出现该来源的 `user/message`（被认领）时，随后的回合才被视为补写回合。投递成功但 120 秒内未被认领视为过期，不阻塞下一次补写；上一笔补写未被认领前不会再排第二笔。
 3. **收尾指令**：注册一段 system prompt（name `empty-turn-guard`，order 960，`interpolate: false`），要求每回合以看得见的正文结束、禁止用零宽字符/空白/空行充当回答。
-4. **防误伤**：同一回合最多补一次；补写回合再空则停止连环；每会话每小时最多 `maxNudgesPerHour` 次（按**投递成功**计，取消/失败不占额度）；定时器未触发前收到**有人说话**的消息（真人、子代理回报、微信/社交桥）立即取消，宿主的背景注入（`runtime-context` / `time-context` / `skill-catalog` / `dsh-mnemon` / `plugin:*`）不算；新回合自己起来时丢弃过期补写；`plugin:empty-turn-guard` 来源的消息不参与判定；插件在回合中途加载（没见过 `turn/start`）时不判定该回合。
+4. **防误伤**：同一回合最多补一次；补写回合再空则停止连环；每会话每小时最多 `maxNudgesPerHour` 次（按**投递成功**计，取消/失败不占额度）；定时器未触发前收到**有人说话**的消息（真人、子代理回报、微信/社交桥）立即取消，宿主的背景注入（`runtime-context` / `time-context` / `skill-catalog` / `dsh-mnemon` / `agent-instructions` / `ptc-mode` / `model-selection` / `session-reference` / `skill-invocation` / `compact-checkpoint` / `plugin:*`）不算；新回合自己起来时丢弃过期补写；`plugin:empty-turn-guard` 来源的消息不参与判定；插件在回合中途加载（没见过 `turn/start`）时不判定该回合。
 
 非 `completed` 的回合（`interrupted` / `error` / `aborted` / `max-tokens` / `blocked`）一律不补写。
+
+`dsh headless` 是一次性进程：补写定时器触发时进程可能已经退出，补写无法完成；本插件面向桌面端 / 网页端这类长驻宿主。
 
 ## 安装
 
