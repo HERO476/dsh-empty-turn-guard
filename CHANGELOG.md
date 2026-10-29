@@ -3,6 +3,51 @@
 本文件记录 dsh-empty-turn-guard 的所有重要变更，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.4] - 2026-10-29
+
+修复第三轮评审（技术方案评审团：架构 / 应用安全 / 现实核对）确认的缺陷。核心是**空回合判定本身**：
+0.1.3 之前漏判「UI 空白但 `visibleChars >= 1`」的回合，而那正是本插件唯一要救的场景。
+
+### 修复
+
+- **零宽集改用 Unicode 属性（高）**：0.1.3 的手写码位清单漏了 `U+2066–U+2069`（双向隔离符）、`U+E0001`、
+  `U+E0020–U+E007F`（tag 字符）、`U+1D173–U+1D17A`（音乐控制符）——这些字符渲染为空白却被计成正文，
+  回合因此不补写。现在改用 `\p{Default_Ignorable_Code_Point}` 并补 `U+2800`/`U+3164`/`U+FFA0` 三个
+  不属于 DI 的填充符，实测不误伤中文/英文/数字/标点。
+- **`inject` 假投递（高）**：`agent.inject(m)` 实际是 `send(m, 'next-step', false)`——**不唤醒**，
+  消息躺在 next-step 队列里等下一个回合认领。旧实现把它当第三级兜底，于是日志写 `DELIVERED`、
+  `awaitingGuardTurn` 置 `true`，却没有任何新回合发生，下一次真空回合还会被当成「连环补写」跳过。
+  0.1.4 起只保留会唤醒的 `send(next-turn, wakeup)` 与等价的 `followup`，全部失败就明确记 `NOT DELIVERED`。
+- **热重载中途误判（中）**：0.1.3 去掉了 `assistantMessages > 0` 门槛后，插件在回合中途加载/热重载时
+  看不到该回合早前的助手消息，`visibleChars = 0` 会被当成空回合而发假提醒。新增 `sawTurnStart`，
+  没见过 `turn/start` 的回合一律不判定（日志 `turn/start not observed`）。
+- **日志 tag 恒定（中）**：根会话 id 形如 `session-<uuid>`，`id.slice(0, 8)` 恒为 `session-`，多会话无法区分。
+  现在先剥 `session-` 前缀再取 8 位。
+- **图片附件回合误判（低）**：只有 `image` / `file` / `attachment` / `audio` / `video` 的回合在界面上并非空白，
+  不再判空（`tool-call`、`reasoning` 仍按空回合处理）。
+- **`turn` 缺失（低）**：`turn/end` 没有数值 `turn` 时直接跳过判定（旧实现拿 `s.turn` 兜底，两者都为 `null`
+  会命中 `guardSentForTurn === turn` 而静默跳过）。
+- **会话范围（低）**：默认只处理根会话（`/^session-/`）。子代理会话（裸 UUID）「只调工具不回正文」是正常收尾，
+  社交桥会话（`social-*`）也不是空回合，都不再补写。需要旧行为可设 `sessionScope: 'all'`。
+- **插话判定（低）**：`runtime-context` / `time-context` / `skill-catalog` / `dsh-mnemon` 与 `plugin:*`
+  视为背景注入，不取消待发补写；其余来源（真人、子代理回报、微信/社交桥）都取消。
+- **兜底日志不轮转（低）**：`maybeRotate` 现在对主路径和 `os.tmpdir()` 兜底路径都生效，轮转前显式删除旧 `.1`
+  （避免 Windows 上覆盖失败）。
+- **`engines.dsh` 加上界**：`>=0.2.1-rc.1 <0.3.0`。原来没有上界，将来 0.3.0 起 API 若变，插件会静默加载失败或行为异常。
+
+### 测试
+
+- `test/guard.test.mjs` 从 19 条扩到 **27 条**。新增：中途加载不判定、图片附件不判空、`turn` 缺失、
+  会话范围（root/all）、后台注入不取消 / 社交桥取消、只有 `inject` 可用时不算投递成功、
+  DI 码位（`U+2066`/`U+E0020`/`U+1D173`/`U+E0100`/`U+FFA0`）、日志 tag 剥前缀。
+
+### 已知未解
+
+- 补写消息仍以 `role:'user'` 落进持久转录（`source.kind = 'plugin:empty-turn-guard'`）。宿主
+  `dsh-session` 对 `source.kind` 无枚举校验，桌面 UI 会把非 `user` 来源渲染成 `kind:'context'` 的上下文块
+  而非用户气泡，但转录层面它仍是一条 user 消息——插件侧无法改 `role`，只能靠 `source` 标注。
+- 生产环境至今 **0 次**真实补写投递（日志 `nudge DELIVERED` 为 0），链路正确性仍缺一次端到端演练。
+
 ## [0.1.3] - 2026-10-26
 
 修复评审（技术方案评审团：架构 / 应用安全 / 现实核对）发现的缺陷，重点是空回合补写的状态机。
@@ -25,7 +70,7 @@
 
 ### 测试
 
-- `test/guard.test.mjs` 从 9 条扩到 18 条，并修正**事件载荷形状**：宿主 `session.append(type, data)` 的 `data` 就是消息本体（`data.source.kind`），旧用例包了一层 `{ message: { source } }`，导致「真人插话取消」「plugin 来源不参与判定」两条用例实际空转。新增：非 completed 后不污染下一回合、投递全失败后可恢复、`runtime-context` 不取消、新回合丢弃过期补写、配置 0/非法值语义、扩展零宽集、热启用回填、卸载清理。
+- `test/guard.test.mjs` 从 9 条扩到 **19 条**（此处原写「18 条」有误），并修正**事件载荷形状**：宿主 `session.append(type, data)` 的 `data` 就是消息本体（`data.source.kind`），旧用例包了一层 `{ message: { source } }`，导致「真人插话取消」「plugin 来源不参与判定」两条用例实际空转。新增：非 completed 后不污染下一回合、投递全失败后可恢复、`runtime-context` 不取消、新回合丢弃过期补写、配置 0/非法值语义、扩展零宽集、热启用回填、卸载清理。
 
 ### 明确不做
 

@@ -10,8 +10,11 @@
  *   turn/end          { turn, reason: { kind } }
  *
  * 覆盖：零宽空回合补写、正常回合不干预、非 completed 不补写、补写回合再空不连环、
- * 真人插话取消、runtime-context 不取消、send 失败降级 followup、投递全失败后标志清理、
- * 配置 0/非法值语义、扩展零宽字符集、turn 前进后丢弃过期补写、小时预算、prompt 段落参数。
+ * 真人插话取消、后台注入（runtime-context/time-context/skill-catalog/dsh-mnemon/plugin:*）
+ * 不取消、非人来源（社交桥/子代理回报）取消、send 失败降级 followup、投递全失败后标志清理、
+ * inject 不再被当作投递成功、配置 0/非法值语义、扩展零宽字符集（含 DI 属性码位）、
+ * turn 前进后丢弃过期补写、小时预算、prompt 段落参数、热重载中途不误判（sawTurnStart）、
+ * 图片附件回合不判空、turn 缺失不判定、会话范围（root/all）、日志 tag 剥前缀。
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -36,7 +39,7 @@ function makeRig(config = {}, registryAgents = []) {
     get: (service) => (service === 'agents' ? { list: () => registryAgents } : undefined),
   };
   apply(ctx, { delayMs: 5, logFile, maxNudgesPerHour: 3, ...config });
-  const session = { id: 'sess-' + seq };
+  const session = { id: 'session-' + (1000 + seq) };
   const agent = {
     session,
     send(message, target, wakeup) { sent.push({ via: 'send', target, wakeup, text: message.content[0].text, message }); },
@@ -159,7 +162,7 @@ test('补写定时器未触发前真人插话 → 取消补写', async () => {
   rig.fire('user/message', human());
   await sleep(140);
   assert.equal(rig.sent.length, 0);
-  assert.match(rig.log(), /pending nudge CANCELLED \(human message\)/);
+  assert.ok(rig.log().includes('CANCELLED (user message (user))'), 'cancel reason should name the source kind');
   rig.cleanup();
 });
 
@@ -199,10 +202,10 @@ test('send 抛错 → 降级到 followup', async () => {
   rig.cleanup();
 });
 
-test('三级投递全失败 → 清标志，下一次空回合仍补写', async () => {
+test('两级投递全失败（inject 已移除） → 清标志，下一次空回合仍补写', async () => {
   const rig = makeRig();
   const boom = () => { throw new Error('nope'); };
-  rig.agent.send = boom; rig.agent.followup = boom; rig.agent.inject = boom;
+  rig.agent.send = boom; rig.agent.followup = boom;
   rig.fire('turn/start', { turn: 11 });
   rig.fire('assistant/message', { turn: 11, step: 1, message: assistant(ZW) });
   rig.fire('turn/end', { turn: 11, reason: { kind: 'completed' } });
@@ -290,7 +293,7 @@ test('非法配置回落默认值；enabled:"false" 真的关闭', async () => {
 });
 
 test('热启用：启动时从 agent 注册表回填，无需等 agent/created', async () => {
-  const preexisting = { session: { id: 'sess-preexisting' }, send() { preexisting.sent = true; } };
+  const preexisting = { session: { id: 'session-preexisting' }, send() { preexisting.sent = true; } };
   const rig = makeRig({ __skipCreate: true }, [preexisting]);
   assert.match(rig.log(), /agent registry backfilled: \+1/);
   rig.cleanup();
@@ -316,6 +319,128 @@ test('effect 注册了清理函数（卸载时清定时器）', () => {
     const dispose = eff();
     if (typeof dispose === 'function') dispose();
   }
+  rig.cleanup();
+});
+
+test('插件在回合中途加载（没看到 turn/start）→ 不判定、不补写', async () => {
+  const rig = makeRig();
+  // 只有 assistant/message 与 turn/end，缺 turn/start：visibleChars 少算是必然的。
+  rig.fire('assistant/message', { turn: 50, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 50, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 0, 'mid-turn load must not be judged empty');
+  assert.ok(rig.log().includes('turn/start not observed'));
+  rig.cleanup();
+});
+
+test('图片/文件附件回合 → 不算空回合', async () => {
+  const rig = makeRig();
+  rig.fire('turn/start', { turn: 51 });
+  rig.fire('assistant/message', {
+    turn: 51,
+    step: 1,
+    message: { role: 'assistant', content: [{ type: 'image', source: { type: 'base64' } }] },
+  });
+  rig.fire('turn/end', { turn: 51, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 0, 'image-only turn is visible content');
+  assert.ok(rig.log().includes('empty=false'));
+  rig.cleanup();
+});
+
+test('turn/end 缺少数值 turn → 跳过判定', async () => {
+  const rig = makeRig();
+  rig.fire('turn/start', { turn: 52 });
+  rig.fire('assistant/message', { turn: 52, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 0);
+  assert.ok(rig.log().includes('without numeric turn'));
+  rig.cleanup();
+});
+
+test('会话范围：默认只处理根会话（session-*），子代理裸 UUID 不判定', async () => {
+  const rig = makeRig();
+  const handler = rig.handlers.get('session/event');
+  const child = { id: 'abc59fa8-6ffc-4b11-9653-3bdaae610dc0' };
+  const fireChild = (type, data) => handler(child, { type, data, seq: ++seq, time: Date.now() });
+  fireChild('turn/start', { turn: 53 });
+  fireChild('assistant/message', { turn: 53, step: 1, message: assistant(ZW) });
+  fireChild('turn/end', { turn: 53, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 0, 'child session must be out of scope by default');
+  assert.ok(!rig.log().includes('turn=53'), 'child session must not even be judged');
+  rig.cleanup();
+
+  const all = makeRig({ sessionScope: 'all' });
+  const h2 = all.handlers.get('session/event');
+  const child2 = { id: 'abc59fa8-6ffc-4b11-9653-3bdaae610dc0' };
+  h2(child2, { type: 'turn/start', data: { turn: 54 }, seq: ++seq, time: Date.now() });
+  h2(child2, { type: 'assistant/message', data: { turn: 54, step: 1, message: assistant(ZW) }, seq: ++seq, time: Date.now() });
+  h2(child2, { type: 'turn/end', data: { turn: 54, reason: { kind: 'completed' } }, seq: ++seq, time: Date.now() });
+  await sleep(60);
+  assert.ok(all.log().includes('turn/end turn=54'), 'sessionScope=all should judge child sessions');
+  all.cleanup();
+});
+
+test('后台注入（time-context / skill-catalog / dsh-mnemon）不取消补写；社交桥会取消', async () => {
+  for (const kind of ['time-context', 'skill-catalog', 'dsh-mnemon', 'plugin:other']) {
+    const rig = makeRig({ delayMs: 60 });
+    rig.fire('turn/start', { turn: 55 });
+    rig.fire('assistant/message', { turn: 55, step: 1, message: assistant(ZW) });
+    rig.fire('turn/end', { turn: 55, reason: { kind: 'completed' } });
+    rig.fire('user/message', { role: 'user', content: [{ type: 'text', text: 'bg' }], source: { kind } });
+    await sleep(120);
+    assert.equal(rig.sent.length, 1, kind + ' must not cancel the nudge');
+    rig.cleanup();
+  }
+
+  const rig = makeRig({ delayMs: 60 });
+  rig.fire('turn/start', { turn: 56 });
+  rig.fire('assistant/message', { turn: 56, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 56, reason: { kind: 'completed' } });
+  rig.fire('user/message', { role: 'user', content: [{ type: 'text', text: 'hi' }], source: { kind: 'wechat-social-bridge' } });
+  await sleep(120);
+  assert.equal(rig.sent.length, 0, 'social bridge message is real activity -> cancel');
+  assert.ok(rig.log().includes('wechat-social-bridge'));
+  rig.cleanup();
+});
+
+test('只有 inject 可用 → 不算投递成功（不唤醒，不会开新回合）', async () => {
+  const rig = makeRig();
+  const boom = () => { throw new Error('no waking transport'); };
+  rig.agent.send = boom;
+  rig.agent.followup = boom;
+  rig.fire('turn/start', { turn: 57 });
+  rig.fire('assistant/message', { turn: 57, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 57, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 0, 'inject must never be used as a fallback');
+  assert.ok(rig.log().includes('all waking transports failed'));
+  assert.ok(rig.log().includes('awaitingGuardTurn cleared'));
+  rig.cleanup();
+});
+
+test('Default_Ignorable 码位（U+2066 / U+E0020 / U+1D173 / U+E0100 / U+FFA0）判空', async () => {
+  for (const ch of ['\u2066', '\u{e0020}', '\u{1d173}', '\u{e0100}', '\u{ffa0}']) {
+    const rig = makeRig();
+    rig.fire('turn/start', { turn: 58 });
+    rig.fire('assistant/message', { turn: 58, step: 1, message: assistant(ch) });
+    rig.fire('turn/end', { turn: 58, reason: { kind: 'completed' } });
+    await sleep(40);
+    assert.equal(rig.sent.length, 1, 'U+' + ch.codePointAt(0).toString(16) + ' must count as empty');
+    rig.cleanup();
+  }
+});
+
+test('日志 tag 剥掉 session- 前缀（否则所有根会话都是 [session-]）', async () => {
+  const rig = makeRig();
+  rig.fire('turn/start', { turn: 59 });
+  rig.fire('turn/end', { turn: 59, reason: { kind: 'completed' } });
+  await sleep(40);
+  const text = rig.log();
+  assert.ok(!text.includes('[session-]'), 'tag must not be the bare prefix');
+  assert.ok(text.includes('[' + rig.session.id.replace('session-', '') + ']'), 'tag should be the id without prefix');
   rig.cleanup();
 });
 
