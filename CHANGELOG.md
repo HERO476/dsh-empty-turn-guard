@@ -3,6 +3,40 @@
 本文件记录 dsh-empty-turn-guard 的所有重要变更，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.6] - 2026-10-30
+
+修复第四轮复核（DSH `0.2.1-rc.5`）确认的两个**独立状态机缺陷**，以及用户点停止不可观察、
+日志/配置层面的若干小问题。`lib/index.js` 的判定口径没变，改的都是「状态什么时候被清/被置」。
+
+### 修复
+
+- **P2-A 认领不校验消息 id（中）**：`user/message` 只要 `source.kind = 'plugin:empty-turn-guard'`
+  就置 `awaitingGuardTurn = true`，而 `matched` 只写进日志。于是上次进程遗留、重放、或另一实例
+  写入的同来源消息会被当成「补写回合」，让下一个**真正的**空回合被 `stop chaining` 静默跳过。
+  现在只有 id 与在途补写一致才置位，不一致记 `NOT ours` 并忽略。
+- **P2-B 缺少数值 turn 的 turn/end 不清状态（中）**：早退分支在 `wasGuard` 取值与清零之前
+  `return`，`awaitingGuardTurn` 永久留在 `true`。现在先取后清，再判断 turn 是否可判定。
+  （当前宿主唯一 emitter 恒给 number，属潜伏缺陷，用 mock 可复现。）
+- **P2-C 用户点停止不可观察（低，缓解）**：宿主 `cancel()` 只清 inbox + abort，不发 session 事件，
+  900ms 窗口内仍会补写。现在订阅宿主的 `agent/inbox/discarded`，**只**在丢弃的正是我们那条
+  补写时才撤标记；宿主不广播该事件时退回旧行为，不会误伤。
+- **日志轮转更鲁棒（低）**：Windows 上多进程持句柄时 `rename` 会 EPERM/EBUSY，现在回退
+  `truncate(0)` 并记一条日志（宁可丢历史，也不让日志无限长）。
+- **agent 注册表对账（低）**：除 `agent/disposed` 外，注册表每增长 20 条向宿主 `agents.list()`
+  对账一次，删掉已消失的条目。
+- **会话过滤留痕（低）**：`sessionScope='root'` 过滤掉的会话每个 id 记一条 `skip scope` 日志，
+  「插件没加载」与「被 scope 静默过滤」不再长得一样。
+- **激活日志带版本号**：`plugin activated: pid=… version=…`，版本从自身 `package.json` 读，
+  不再需要靠「某字段是否存在」推断进程里跑的是哪一版。
+- **`instructionText` 上限 4000 字符**：它进每回合 system prompt，超长会长期抬高输入 token。
+
+### 测试
+
+- `test/guard.test.mjs` 28 → **34 条**：新增 P2-A（id 不符不吞下一回合）、P2-B（缺 turn 也清状态）、
+  P2-C（丢弃自己那条 → 释放在途标记；丢弃别人的 → 不动）、激活日志版本号、`skip scope` 只记一次、
+  `instructionText` 截断。
+- 修了测试夹具的一处失真：`guardClaim()` 过去不带 id，无法表达「认领」。
+
 ## [0.1.5] - 2026-10-29
 
 修复桌面端 / 网页端复核发现的状态机与来源分类问题。

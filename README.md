@@ -74,21 +74,36 @@
 [2026-10-25T01:49:13.941Z] plugin activated: pid=17520 enabled=true instruction=true dshHome=C:\Users\me\.dsh
 [2026-10-25T01:49:13.942Z] prompt section registered: order=960 chars=222
 [2026-10-25T01:49:13.942Z] guard armed (uptime=1ms)
-[2026-10-25T01:58:02.114Z] turn/end turn=3 kind=completed steps=4 visibleChars=812 empty=false wasGuard=false [5f884825]
-[2026-10-25T02:03:41.507Z] turn/end turn=4 kind=completed steps=6 visibleChars=0 empty=true wasGuard=false [5f884825]
+[2026-10-25T01:58:02.114Z] turn/end turn=3 kind=completed steps=4 visibleChars=812 empty=false wasGuard=false sawStart=true [5f884825]
+[2026-10-25T02:03:41.507Z] turn/end turn=4 kind=completed steps=6 visibleChars=0 empty=true wasGuard=false sawStart=true [5f884825]
 [2026-10-25T02:03:41.508Z] nudge SCHEDULED turn=4 delay=900ms [5f884825] (empty completed turn)
 [2026-10-25T02:03:42.561Z] nudge DELIVERED via send(next-turn,wakeup) [5f884825]
+[2026-10-25T02:03:45.004Z] guard message claimed turn=5 matched=true [5f884825]
 ```
 
-正常回合只需看 `empty=false`；出现 `empty=true` 就应紧跟一条 `nudge DELIVERED`。`[...]` 是会话 id 前 8 位，`wasGuard` 表示该回合是不是补写回合。
+正常回合只需看 `empty=false`；出现 `empty=true` 就应紧跟一条 `nudge DELIVERED`，再往后出现 `guard message claimed ... matched=true` 才说明补写回合真的起来了。`[...]` 是会话 id（剥掉 `session-` 前缀）前 8 位，`wasGuard` 表示该回合是不是补写回合，`sawStart` 表示插件是否看到过该回合的 `turn/start`（中途热加载时为 false，此时不判定）。
+
+`version=` 是进程里真正加载的版本号（从包自身 `package.json` 读）——**升级后先看这一行**，不要靠「某个日志字段有没有」推断跑的是哪一版（0.1.4 与 0.1.5 都打过 `sawStart`，这个推断会错）。
+
+排查常用短语：`skip scope`（被 `sessionScope` 过滤掉的会话）、`turn/start not observed`（热加载中途，不判定）、`NOT ours`（同来源但 id 对不上，已忽略）、`DISCARDED by host`（用户停止，补写被丢弃）、`a nudge is already awaiting claim`（上一笔还没被认领）、`stop chaining`（补写回合又空，按设计不再连环）、`budget exhausted`（本小时额度用完）。
 
 ## 实现约束
 
 - 只 import Node 内置模块（`node:fs` / `node:os` / `node:path` / `node:crypto`）。插件被装进 profile 的 `node_modules` 后，裸名 `@deepseek-ai/*` 在插件目录下 Node 解析不到，少一个依赖就少一个「插件整个加载失败」的风险面。
 - 不导出 `Config` schema（宿主允许无 schema 的 entry），配置在 `apply(ctx, config)` 内部做防御性默认值合并。
 - 所有逻辑包在 try/catch 里：任何异常只写日志，不向上抛，不会拖垮宿主回合。
-- 宿主门槛 `engines.dsh = ">=0.2.1-rc.1 <0.3.0"`：本插件用到的宿主 API 在 `0.2.1-rc.1` / `rc.2` / `rc.3` / `rc.4` 里实现完全一致（rc.3 与 rc.4 的 `dsh-system-prompt` / `dsh-agent` / `dsh-session` / `dsh-agent-loop` / `dsh-app-boot` 的 `lib/index.js` sha256 逐字节相同），所以门槛只设到 rc.1。**不要写成 `>=0.2.1`**——semver 里预发布版本不满足不含预发布标识的同段范围，`0.2.1-rc.3` 对 `>=0.2.1` 判为 `false`，会连 rc 版本一起挡掉。上界 `<0.3.0` 是安全阀：0.3.0 起若宿主 API 有变，插件应静默跳过而不是带着错误假设继续跑。门槛不满足时宿主会把整个 bundle 静默跳过（启动只留一行 `skipping profile bundle`）。
+- 宿主门槛 `engines.dsh = ">=0.2.1-rc.1 <0.3.0"`：本插件用到的宿主 API 在 `0.2.1-rc.1` / `rc.2` / `rc.3` / `rc.4` / `rc.5` 里实现完全一致（rc.3 / rc.4 / rc.5 的 `dsh-system-prompt` / `dsh-agent` / `dsh-session` / `dsh-agent-loop` / `dsh-app-boot` 的 `lib/index.js` sha256 逐字节相同），所以门槛只设到 rc.1。**不要写成 `>=0.2.1`**——semver 里预发布版本不满足不含预发布标识的同段范围，`0.2.1-rc.3` 对 `>=0.2.1` 判为 `false`，会连 rc 版本一起挡掉。上界 `<0.3.0` 是安全阀：0.3.0 起若宿主 API 有变，插件应静默跳过而不是带着错误假设继续跑。门槛不满足时宿主会把整个 bundle 静默跳过（启动只留一行 `skipping profile bundle`）。
+- **升级宿主前请先看门槛**：`<0.3.0` 的上界意味着宿主升到 0.3.0 时本插件会**静默不加载**（`dsh-app-boot` 只往 stderr 写一行 `skipping profile bundle`）。请先看日志首行 `plugin activated: ... version=...`：没有这一行就是没加载。届时要么升级本插件并把上界往上放，要么临时把 `engines.dsh` 放宽（自担 API 漂移风险）。
 - `inject = ['systemPrompt']` 是 cordis 的**硬依赖**，不做「可选依赖」改造：本版本 `@deepseek-ai/cordis` 的 `Inject.resolve` 只接受「数组」或「name → config 映射」，没有 `required`/`optional` 语义；写成 `{ optional: [...] }` 会被当成「等一个叫 optional 的服务」，插件将永不激活。
+
+## 已知限制
+
+- **补写消息以 `role: 'user'` 落盘**（`source.kind = 'plugin:empty-turn-guard'`）：宿主 session 层对 `source.kind` 不做枚举校验，插件侧也改不了 role。桌面前端按 `source.kind !== 'user'` 渲染成上下文卡片（不是用户气泡），mnemon 只收录 `source.kind === 'user'`，所以界面与记忆都不受污染；但**会话转录文件里它确实是一条 user 消息**，审计时要看 `source.kind` 区分。
+- **用户点停止的窗口**：宿主 `cancel()` 只清 inbox + abort，不 append 任何 session 事件。插件订阅了宿主 dispatch 的 `agent/inbox/discarded` 来撤掉自己那条补写，但该事件是否向插件广播取决于宿主的 dispatch 链路；收不到时，「用户已点停止、插件仍在 `delayMs` 后补写」这个窗口依然存在（默认 900ms，可通过 `delayMs` 调小）。真正发出去的那一回合仍受宿主 abort 语义约束。
+- **`sessionScope: 'root'` 的判定依据是 id 前缀 `session-`**：老版本（v3 日志）的纯 UUID 会话目录、`social-*` 社交桥会话都算「非根」，默认不处理。被过滤的会话每个 id 只记一条 `skip scope` 日志，不会静默消失。
+- **崩溃遗留**：补写已入队但宿主在认领前崩溃时，该消息可能在下次启动被重放。插件只认 id 匹配的认领（`NOT ours`），因此不会被这种消息骗成「补写回合」，但它仍可能作为一条插件消息出现在转录里。
+- **多宿主共用同一日志文件**：两个进程同时写同一路径时轮转可能失败，此时回退 `truncate(0)` 并记一条 `log rotate fell back to truncate`。
+- **生产环境尚未观测到真实补写**：截至 2026-10-30，本机生产日志里 `nudge DELIVERED` 仍为 0（空回合全部是 `aborted`），所有结论来自单测与 mock 复现。真机端到端（含「补写回合真的开起来」）仍是未验证项。
 
 ## License
 

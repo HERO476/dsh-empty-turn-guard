@@ -70,8 +70,10 @@ const assistant = (text, tool = false) => ({
 const human = (text = '再说一次') => ({ role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } });
 /** 宿主每步注入的运行时上下文消息。 */
 const runtimeContext = () => ({ role: 'user', content: [{ type: 'text', text: 'Current runtime context…' }], source: { kind: 'runtime-context' } });
-/** 插件自己的补写消息被宿主认领后写进转录的样子。 */
-const guardClaim = () => ({ role: 'user', content: [{ type: 'text', text: '【空回合保护 · 插件自动补发】' }], source: { kind: 'plugin:empty-turn-guard' } });
+/** 插件自己的补写消息被宿主认领后写进转录的样子（id 必须是投递时那条消息的 id）。 */
+const guardClaim = (id) => ({ id, role: 'user', content: [{ type: 'text', text: '【空回合保护 · 插件自动补发】' }], source: { kind: 'plugin:empty-turn-guard' } });
+/** 取最近一次投递消息的 id（认领时宿主写回的 id 就是它）。 */
+const lastSentId = (rig) => { const last = rig.sent[rig.sent.length - 1]; return last && last.message && last.message.id; };
 
 const cases = [];
 const test = (title, fn) => cases.push({ title, fn });
@@ -148,7 +150,7 @@ test('补写回合仍然为空 → 不连环补写', async () => {
   await sleep(60);
   assert.equal(rig.sent.length, 1);
   rig.fire('turn/start', { turn: 5 });
-  rig.fire('user/message', guardClaim()); // 补写消息被宿主认领
+  rig.fire('user/message', guardClaim(lastSentId(rig))); // 补写消息被宿主认领
   rig.fire('assistant/message', { turn: 5, step: 1, message: assistant(ZW) });
   rig.fire('turn/end', { turn: 5, reason: { kind: 'completed' } });
   await sleep(60);
@@ -270,7 +272,7 @@ test('小时预算：3 次之后不再补写', async () => {
     rig.fire('turn/end', { turn: t, reason: { kind: 'completed' } });
     await sleep(40);
     rig.fire('turn/start', { turn: t + 1 });
-    rig.fire('user/message', guardClaim());
+    rig.fire('user/message', guardClaim(lastSentId(rig)));
     rig.fire('assistant/message', { turn: t + 1, step: 1, message: assistant('补出来的结论') });
     rig.fire('turn/end', { turn: t + 1, reason: { kind: 'completed' } });
     await sleep(40);
@@ -442,7 +444,7 @@ test('投递 ≠ 认领：未认领的补写不把下一回合当成补写回合
 
   // 宿主随后认领补写消息：它所在的回合才是补写回合。
   rig.fire('turn/start', { turn: 62 });
-  rig.fire('user/message', guardClaim());
+  rig.fire('user/message', guardClaim(lastSentId(rig)));
   rig.fire('assistant/message', { turn: 62, step: 1, message: assistant(ZW) });
   rig.fire('turn/end', { turn: 62, reason: { kind: 'completed' } });
   await sleep(60);
@@ -487,6 +489,107 @@ test('日志 tag 剥掉 session- 前缀（否则所有根会话都是 [session-]
   const text = rig.log();
   assert.ok(!text.includes('[session-]'), 'tag must not be the bare prefix');
   assert.ok(text.includes('[' + rig.session.id.replace('session-', '') + ']'), 'tag should be the id without prefix');
+  rig.cleanup();
+});
+
+// ---- 0.1.6 回归：两个状态机缺陷 + 停止丢弃 + 日志/配置细节 ----
+
+test('P2-A：同来源但 id 不符的补写消息不算「补写回合」，下一个真空回合仍会补写', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 70 });
+  rig.fire('assistant/message', { turn: 70, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 70, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.equal(rig.sent.length, 1);
+
+  // 一条 plugin 来源但 id 对不上的消息（上次进程遗留 / 重放 / 另一实例写入）
+  rig.fire('turn/start', { turn: 71 });
+  rig.fire('user/message', guardClaim('some-other-id'));
+  rig.fire('assistant/message', { turn: 71, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 71, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.match(rig.log(), /NOT ours/);
+  assert.doesNotMatch(rig.log(), /wasGuard=true/);
+  assert.equal(rig.sent.length, 2, 'mismatched claim must not suppress the next real nudge');
+  rig.cleanup();
+});
+
+test('P2-B：turn/end 缺少数值 turn 时也要清掉 awaitingGuardTurn（否则下一次真空回合被吞）', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  // 回合 80 空 → 补写；回合 81 认领补写（awaitingGuardTurn=true）后带着字符串 turn 结束
+  rig.fire('turn/start', { turn: 80 });
+  rig.fire('assistant/message', { turn: 80, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 80, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.equal(rig.sent.length, 1);
+  rig.fire('turn/start', { turn: 81 });
+  rig.fire('user/message', guardClaim(lastSentId(rig)));
+  rig.fire('turn/end', { turn: '81', reason: { kind: 'completed' } }); // 缺少数值 turn
+  await sleep(20);
+  assert.match(rig.log(), /skip judgement \(state reset\)/);
+
+  // 下一个真正的空回合必须还能补写（旧版会 stop chaining 静默跳过）
+  rig.fire('turn/start', { turn: 82 });
+  rig.fire('assistant/message', { turn: 82, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 82, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.equal(rig.sent.length, 2, 'stale awaitingGuardTurn must not swallow the next empty turn');
+  assert.doesNotMatch(rig.log(), /stop chaining/);
+  rig.cleanup();
+});
+
+test('P2-C：宿主丢弃了已投递未认领的补写 → 清在途标记，释放后续补写', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 90 });
+  rig.fire('assistant/message', { turn: 90, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 90, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.equal(rig.sent.length, 1);
+
+  // 用户点停止：宿主 cancel() 清空 inbox 并 dispatch 丢弃事件
+  const discard = rig.handlers.get('agent/inbox/discarded');
+  assert.equal(typeof discard, 'function', 'plugin should subscribe to agent/inbox/discarded');
+  discard({ agent: rig.agent, message: rig.sent[0].message });
+  assert.match(rig.log(), /DISCARDED by host before claim/);
+
+  // 在途标记已释放：下一个空回合可以立即再补，不会被「already awaiting claim」卡住
+  rig.fire('turn/start', { turn: 91 });
+  rig.fire('assistant/message', { turn: 91, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 91, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.equal(rig.sent.length, 2, 'discarded nudge must not block the next empty turn');
+  assert.doesNotMatch(rig.log(), /already awaiting claim/);
+  rig.cleanup();
+});
+
+test('P2-C：丢弃事件只认自己那条消息（id 不符不动定时器）', async () => {
+  const rig = makeRig({ delayMs: 60 });
+  rig.fire('turn/start', { turn: 92 });
+  rig.fire('assistant/message', { turn: 92, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 92, reason: { kind: 'completed' } });
+  const discard = rig.handlers.get('agent/inbox/discarded');
+  discard({ agent: rig.agent, message: { id: 'not-ours', content: [] } });
+  await sleep(120);
+  assert.equal(rig.sent.length, 1, 'a foreign discard must not cancel our scheduled nudge');
+  assert.doesNotMatch(rig.log(), /DISCARDED by host/);
+  rig.cleanup();
+});
+
+test('激活日志带版本号，过滤范围外的会话留下一条 skip scope 日志', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  assert.match(rig.log(), /plugin activated: pid=\d+ version=\S+/);
+  const sub = { id: 'abc59fa8-1111-2222-3333-444455556666' };
+  const fn = rig.handlers.get('session/event');
+  fn(sub, { type: 'turn/start', data: { turn: 1 }, seq: 1, time: Date.now() });
+  fn(sub, { type: 'turn/start', data: { turn: 2 }, seq: 2, time: Date.now() });
+  const hits = (rig.log().match(/skip scope: non-root session/g) || []).length;
+  assert.equal(hits, 1, 'same out-of-scope session should be logged once, not per event');
+  rig.cleanup();
+});
+
+test('自定义收尾指令超长时截断到 4000 字符（避免长期抬高每回合输入）', () => {
+  const rig = makeRig({ instructionText: 'x'.repeat(9000) });
+  assert.equal(rig.sections[0].text.length, 4000);
   rig.cleanup();
 });
 
